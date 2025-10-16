@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use enum_as_inner::EnumAsInner;
 use hyperactor::Actor;
 use hyperactor::ActorHandle;
+use hyperactor::ActorId;
 use hyperactor::ActorRef;
 use hyperactor::Context;
 use hyperactor::Handler;
@@ -29,8 +30,10 @@ use hyperactor::channel::ChannelTransport;
 use hyperactor::host::Host;
 use hyperactor::host::HostError;
 use hyperactor::host::LocalProcManager;
+use hyperactor::host::SingleTerminate;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::time::Duration;
 
 use crate::bootstrap;
 use crate::bootstrap::BootstrapCommand;
@@ -68,6 +71,25 @@ impl HostAgentMode {
             HostAgentMode::Local(host) => host.system_proc(),
         }
     }
+
+    async fn terminate_proc(
+        &self,
+        proc: &ProcId,
+        timeout: Duration,
+    ) -> Result<(Vec<ActorId>, Vec<ActorId>), anyhow::Error> {
+        #[allow(clippy::match_same_arms)]
+        match self {
+            HostAgentMode::Process(host) => host.terminate_proc(proc, timeout).await,
+            HostAgentMode::Local(host) => host.terminate_proc(proc, timeout).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcCreationState {
+    rank: usize,
+    created: Result<(ProcId, ActorRef<ProcMeshAgent>), HostError>,
+    stopped: bool,
 }
 
 /// A mesh agent is responsible for managing a host iny a [`HostMesh`],
@@ -75,6 +97,7 @@ impl HostAgentMode {
 #[hyperactor::export(
     handlers=[
         resource::CreateOrUpdate<()>,
+        resource::Stop,
         resource::GetState<ProcState>,
         resource::GetRankStatus,
         ShutdownHost
@@ -82,7 +105,7 @@ impl HostAgentMode {
 )]
 pub struct HostMeshAgent {
     host: Option<HostAgentMode>,
-    created: HashMap<Name, (usize, Result<(ProcId, ActorRef<ProcMeshAgent>), HostError>)>,
+    created: HashMap<Name, ProcCreationState>,
 }
 
 impl fmt::Debug for HostMeshAgent {
@@ -141,9 +164,48 @@ impl Handler<resource::CreateOrUpdate<()>> for HostMeshAgent {
         }
         self.created.insert(
             create_or_update.name.clone(),
-            (create_or_update.rank.unwrap(), created),
+            ProcCreationState {
+                rank: create_or_update.rank.unwrap(),
+                created,
+                stopped: false,
+            },
         );
 
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<resource::Stop> for HostMeshAgent {
+    async fn handle(&mut self, cx: &Context<Self>, message: resource::Stop) -> anyhow::Result<()> {
+        let host = self.host.as_mut().expect("host present");
+        let timeout = hyperactor::config::global::get(hyperactor::config::PROCESS_EXIT_TIMEOUT);
+        // We don't remove the proc from the state map, instead we just store
+        // its state as Stopped.
+        let proc = self.created.get_mut(&message.name);
+        let (rank, status) = match proc {
+            Some(ProcCreationState {
+                rank,
+                created,
+                stopped,
+            }) => match created {
+                Ok((proc_id, _)) => {
+                    if !*stopped {
+                        host.terminate_proc(proc_id, timeout).await?;
+                    }
+                    *stopped = true;
+                    // use Stopped as a successful result for Stop.
+                    (*rank, resource::Status::Stopped)
+                }
+                Err(e) => (
+                    *rank,
+                    resource::Status::Failed(format!("Actor already failed with {}", e)),
+                ),
+            },
+            // TODO: represent unknown rank
+            None => (usize::MAX, resource::Status::NotExist),
+        };
+        message.reply.send(cx, (rank, status).into())?;
         Ok(())
     }
 }
@@ -164,8 +226,25 @@ impl Handler<resource::GetRankStatus> for HostMeshAgent {
         };
 
         let rank_status = match created {
-            (rank, Ok(_)) => (*rank, resource::Status::Running),
-            (rank, Err(e)) => (*rank, resource::Status::Failed(e.to_string())),
+            ProcCreationState {
+                rank,
+                created: Ok(_),
+                stopped,
+            } => (
+                *rank,
+                if *stopped {
+                    resource::Status::Stopped
+                } else {
+                    resource::Status::Running
+                },
+            ),
+            // If the creation failed, show as Failed instead of Stopped even if
+            // the proc was stopped.
+            ProcCreationState {
+                rank,
+                created: Err(e),
+                ..
+            } => (*rank, resource::Status::Failed(e.to_string())),
         };
         get_rank_status.reply.send(cx, rank_status.into())?;
 
@@ -236,9 +315,17 @@ impl Handler<resource::GetState<ProcState>> for HostMeshAgent {
             .as_process()
             .map(Host::manager);
         let state = match self.created.get(&get_state.name) {
-            Some((_rank, Ok((proc_id, mesh_agent)))) => resource::State {
+            Some(ProcCreationState {
+                created: Ok((proc_id, mesh_agent)),
+                stopped,
+                ..
+            }) => resource::State {
                 name: get_state.name.clone(),
-                status: resource::Status::Running,
+                status: if *stopped {
+                    resource::Status::Stopped
+                } else {
+                    resource::Status::Running
+                },
                 state: Some(ProcState {
                     proc_id: proc_id.clone(),
                     mesh_agent: mesh_agent.clone(),
@@ -249,7 +336,9 @@ impl Handler<resource::GetState<ProcState>> for HostMeshAgent {
                     },
                 }),
             },
-            Some((_rank, Err(e))) => resource::State {
+            Some(ProcCreationState {
+                created: Err(e), ..
+            }) => resource::State {
                 name: get_state.name.clone(),
                 status: resource::Status::Failed(e.to_string()),
                 state: None,

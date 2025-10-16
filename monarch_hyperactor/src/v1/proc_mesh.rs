@@ -177,10 +177,33 @@ impl PyProcMesh {
         Ok(self.mesh_ref()?.region().into())
     }
 
-    fn stop_nonblocking(&self) -> PyResult<PyPythonTask> {
-        Err(PyNotImplementedError::new_err(
-            "v1::PyProcMesh::stop not implemented",
-        ))
+    fn stop_nonblocking(&self, instance: &PyInstance) -> PyResult<PyPythonTask> {
+        // Clone the necessary fields from self to avoid capturing self in the async block
+        let (owned_inner, instance) = Python::with_gil(|_py| {
+            let owned_inner = match self {
+                PyProcMesh::Owned(inner) => inner.clone(),
+                PyProcMesh::Ref(_) => {
+                    return Err(PyValueError::new_err(
+                        "ProcMesh is not owned; must be stopped by an owner",
+                    ));
+                }
+            };
+
+            let instance = instance.clone();
+            Ok((owned_inner, instance))
+        })?;
+        PyPythonTask::new(async move {
+            let mut mesh = owned_inner
+                .0
+                .take()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("cannot take mesh: {}", e)))?;
+            instance_dispatch!(instance, async move |cx_instance| {
+                mesh.stop(cx_instance)
+                    .await
+                    .map_err(|e| PyValueError::new_err(format!("error stopping mesh: {}", e)))
+            })
+        })
     }
 
     fn sliced(&self, region: &PyRegion) -> PyResult<Self> {

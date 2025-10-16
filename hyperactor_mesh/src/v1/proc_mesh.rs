@@ -391,6 +391,24 @@ impl ProcMesh {
     pub(crate) fn detach(self) -> ProcMeshRef {
         self.current_ref
     }
+
+    /// Stop this mesh gracefully.
+    pub async fn stop(&mut self, cx: &impl context::Actor) -> anyhow::Result<()> {
+        match &mut self.allocation {
+            ProcMeshAllocation::Allocated { alloc, .. } => {
+                alloc.stop_and_wait().await.map_err(|e| e.into())
+            }
+            ProcMeshAllocation::Owned { hosts, .. } => {
+                let names = self
+                    .current_ref
+                    .ranks
+                    .iter()
+                    .map(|proc_ref| proc_ref.proc_id.clone())
+                    .collect::<Vec<ProcId>>();
+                hosts.stop_proc_mesh(cx, names).await
+            }
+        }
+    }
 }
 
 impl Deref for ProcMesh {

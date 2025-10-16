@@ -64,6 +64,14 @@ declare_attrs! {
         py_name: None,
     })
     pub attr PROC_SPAWN_MAX_IDLE: Duration = Duration::from_secs(30);
+
+    /// The maximum idle time between updates while stopping proc
+    /// meshes.
+    @meta(CONFIG = ConfigAttr {
+        env_name: Some("HYPERACTOR_MESH_PROC_STOP_MAX_IDLE".to_string()),
+        py_name: None,
+    })
+    pub attr PROC_STOP_MAX_IDLE: Duration = Duration::from_secs(30);
 }
 
 /// A reference to a single host.
@@ -628,6 +636,72 @@ impl HostMeshRef {
         }
 
         ProcMesh::create_owned_unchecked(cx, mesh_name, extent, self.clone(), procs).await
+    }
+
+    pub(crate) async fn stop_proc_mesh(
+        &self,
+        cx: &impl hyperactor::context::Actor,
+        procs: impl IntoIterator<Item = ProcId>,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = cx.mailbox().open_accum_port_opts(
+            RankedValues::default(),
+            Some(ReducerOpts {
+                max_update_interval: Some(Duration::from_millis(50)),
+            }),
+        );
+        let mut num_ranks = 0;
+        for proc_id in procs.into_iter() {
+            num_ranks += 1;
+            let Some((addr, _)) = proc_id.as_direct() else {
+                return Err(anyhow::anyhow!(
+                    "host mesh proc {} must be direct addressed",
+                    proc_id,
+                ));
+            };
+
+            // Note that we don't send 1 message per host agent, we send 1 message
+            // per proc.
+            let host = HostRef(addr.clone());
+            host.mesh_agent().send(
+                cx,
+                resource::Stop {
+                    // The name stored in HostMeshAgent is not the same as the
+                    // one stored in the ProcMesh. We instead take each proc id
+                    // and map it to that particular agent.
+                    name: proc_id
+                        .name()
+                        .expect("Must be direct proc")
+                        .parse::<Name>()?,
+                    reply: tx.bind(),
+                },
+            )?;
+        }
+
+        let start_time = RealClock.now();
+
+        match GetRankStatus::wait(rx, num_ranks, config::global::get(PROC_STOP_MAX_IDLE)).await {
+            Ok(statuses) => {
+                if let Some((rank, status)) = statuses.first_failed() {
+                    return Err(anyhow::anyhow!(
+                        "failed to terminate proc mesh: proc rank {} failed with status {}",
+                        rank,
+                        status,
+                    ));
+                }
+            }
+            Err(complete) => {
+                // Fill the remaining statuses with a timeout error.
+                let mut statuses =
+                    RankedValues::from((0..num_ranks, Status::Timeout(start_time.elapsed())));
+                statuses.merge_from(complete);
+
+                return Err(anyhow::anyhow!(
+                    "failed to terminate proc mesh: {:?}",
+                    statuses
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
